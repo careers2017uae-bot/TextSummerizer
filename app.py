@@ -1,7 +1,5 @@
-# app.py (Updated for GROQ API)
-
+# app.py
 import os
-import io
 import time
 from typing import List, Tuple
 
@@ -12,6 +10,7 @@ import PyPDF2
 import numpy as np
 import faiss
 from groq import Groq
+from sentence_transformers import SentenceTransformer
 
 # ---------- Configuration ----------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -20,13 +19,11 @@ if not GROQ_API_KEY:
     st.stop()
 
 client = Groq(api_key=GROQ_API_KEY)
-
-# GROQ MODELS (Updated — no decommissioned models)
-EMBED_MODEL = "nomic-embed-text"
 CHAT_MODEL = "llama-3.1-70b-versatile"
 
-# Embedding dimension for nomic-embed-text
-EMBED_DIM = 768
+# Local embeddings model
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+EMBED_DIM = 384  # MiniLM embedding dimension
 
 # ---------- Utilities ----------
 def extract_text_from_pdf(uploaded_file) -> str:
@@ -42,15 +39,11 @@ def fetch_text_from_url(url: str) -> str:
         resp = requests.get(url, timeout=15, headers={"User-Agent": "GroqRAG/1.0"})
         resp.raise_for_status()
         soup = BeautifulSoup(resp.content, "html.parser")
-
         for tag in soup(["script", "style", "header", "footer", "nav", "aside", "form"]):
             tag.decompose()
-
         paragraphs = [p.get_text(separator=" ", strip=True) for p in soup.find_all("p")]
         paragraphs = [p for p in paragraphs if len(p) > 60]
-
         return "\n\n".join(paragraphs) or soup.get_text(separator=" ", strip=True)
-
     except Exception as e:
         st.warning(f"Unable to fetch URL: {e}")
         return ""
@@ -65,49 +58,25 @@ def chunk_text(text: str, chunk_size:int = 1000, overlap:int = 200) -> List[str]
         i += chunk_size - overlap
     return chunks
 
-# ---------- GROQ Embeddings + FAISS ----------
-def embed_texts(texts: List[str]) -> List[np.ndarray]:
-    vectors = []
-    batch_size = 32
+# ---------- Embeddings + FAISS ----------
+def embed_texts(texts: List[str]) -> np.ndarray:
+    return embedder.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
 
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i+batch_size]
-
-        resp = client.embeddings.create(
-            model=EMBED_MODEL,
-            input=batch
-        )
-
-        for item in resp.data:
-            vectors.append(np.array(item.embedding, dtype=np.float32))
-
-    return vectors
-
-def build_faiss_index(vectors: List[np.ndarray]):
-    if not vectors:
+def build_faiss_index(vectors: np.ndarray):
+    if vectors is None or len(vectors) == 0:
         return None
-
-    vecs = np.vstack(vectors).astype(np.float32)
-
-    # normalize for cosine similarity
-    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-    vecs = vecs / (norms + 1e-12)
-
-    index = faiss.IndexFlatIP(vecs.shape[1])
-    index.add(vecs)
+    dim = vectors.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    index.add(vectors)
     return index
 
-def retrieve_top_k(query, chunks, index, vectors, top_k=5):
-    q_vec = embed_texts([query])[0].astype(np.float32)
-    q_vec = q_vec / (np.linalg.norm(q_vec) + 1e-12)
-    q = q_vec.reshape(1, -1)
-
-    D, I = index.search(q, top_k)
-
+def retrieve_top_k(query:str, chunks:List[str], index:faiss.IndexFlatIP, vectors:np.ndarray, top_k:int=5):
+    q_vec = embed_texts([query])[0].astype(np.float32).reshape(1, -1)
+    D, I = index.search(q_vec, top_k)
     results = [(int(idx), float(score), chunks[idx]) for score, idx in zip(D[0], I[0]) if 0 <= idx < len(chunks)]
     return results
 
-# ---------- GROQ Chat ----------
+# ---------- Groq Chat ----------
 def chat_completion(system_prompt, user_prompt, max_tokens=500):
     try:
         resp = client.chat.completions.create(
@@ -123,63 +92,63 @@ def chat_completion(system_prompt, user_prompt, max_tokens=500):
     except Exception as e:
         return f"⚠️ Groq Error: {e}"
 
-def generate_summary_and_points(full_text: str, retriever_context=None):
+def generate_summary_and_points(full_text: str, retriever_context=None) -> Tuple[str,str]:
     context = "\n\n---\n\n".join(retriever_context) if retriever_context else ""
-
     system_prompt = (
         "You are a concise summarizer. "
         "Return:\n1) 2–3 sentence abstract\n2) 5 bullet key points"
     )
-
     user_prompt = f"{context}\n\n{full_text}"
-
     out = chat_completion(system_prompt, user_prompt)
-
     if "\n1" in out:
         abstract, points = out.split("\n1", 1)
         return abstract.strip(), "1" + points.strip()
-
     return out, ""
 
-# ---------- UI ----------
-st.set_page_config(page_title="Groq RAG Summarizer", page_icon="⚡", layout="wide")
+def answer_question_with_context(question: str, retrieved_chunks: List[Tuple[int,float,str]]) -> str:
+    context_text = "\n\n".join([f"### CHUNK {idx} (score={score:.3f})\n{chunk}" 
+                                for idx, score, chunk in retrieved_chunks])
+    system_prompt = (
+        "You are a helpful assistant that answers questions using only the provided context. "
+        "If the answer is not in the context, say 'I don't know based on the provided document.'"
+    )
+    user_prompt = f"CONTEXT:\n{context_text}\n\nQUESTION:\n{question}"
+    return chat_completion(system_prompt, user_prompt, max_tokens=400)
 
-st.title("⚡ Groq-Powered RAG Text Summarizer")
+# ---------- Streamlit UI ----------
+st.set_page_config(page_title="Groq RAG Summarizer", page_icon="✂️", layout="wide")
+st.title("⚡ GROQ + FAISS RAG Text Summarizer")
 
 input_mode = st.radio("Input Type", ["Paste text", "URL", "PDF"])
+user_text = ""
 
 if input_mode == "Paste text":
-    user_text = st.text_area("Paste your text", height=250, key="txt_input")
-
+    user_text = st.text_area("Paste your document here", height=250, key="txt_input")
 elif input_mode == "URL":
-    url = st.text_input("Enter URL")
+    url = st.text_input("Enter webpage URL")
     if url:
-        fetched = fetch_text_from_url(url)
-        st.code(fetched[:4000])
-        user_text = fetched
-
+        user_text = fetch_text_from_url(url)
+        st.code(user_text[:4000])
 else:
     uploaded = st.file_uploader("Upload PDF", type=["pdf"])
     if uploaded:
-        pdf_text = extract_text_from_pdf(uploaded)
-        st.code(pdf_text[:4000])
-        user_text = pdf_text
+        user_text = extract_text_from_pdf(uploaded)
+        st.code(user_text[:4000])
 
+# Summarization settings
 chunk_size = st.slider("Chunk size (words)", 500, 3000, 1000)
 overlap = st.slider("Chunk overlap", 0, 1000, 200)
 top_k = st.slider("Top-K Retrieval", 1, 10, 4)
 
 if st.button("Summarize"):
-    if not user_text or len(user_text.strip()) < 20:
-        st.warning("Please enter valid text.")
+    if not user_text.strip():
+        st.warning("Please provide valid text input.")
     else:
         chunks = chunk_text(user_text, chunk_size, overlap)
         vectors = embed_texts(chunks)
         index = build_faiss_index(vectors)
-
         retrieved = retrieve_top_k("Main ideas", chunks, index, vectors, top_k)
         retrieved_texts = [r[2] for r in retrieved]
-
         abstract, points = generate_summary_and_points(user_text, retrieved_texts)
 
         st.subheader("📌 Abstract")
@@ -187,3 +156,25 @@ if st.button("Summarize"):
 
         st.subheader("📌 Key Points")
         st.write(points)
+
+        # Save for Q&A
+        st.session_state['rag_context'] = {"chunks": chunks, "vectors": vectors, "index": index}
+
+# Q&A
+st.markdown("---")
+st.header("Ask a question about the document")
+question = st.text_input("Type your question")
+if st.button("Ask Question"):
+    if 'rag_context' not in st.session_state:
+        st.warning("You must first Summarize the document before asking questions.")
+    elif not question.strip():
+        st.warning("Please type a question.")
+    else:
+        rag = st.session_state['rag_context']
+        retrieved = retrieve_top_k(question, rag["chunks"], rag["index"], rag["vectors"], top_k=5)
+        st.markdown("**Retrieved snippets:**")
+        for idx, score, txt in retrieved:
+            st.markdown(f"- [CHUNK {idx}] (score={score:.3f}) {txt[:300]}{'...' if len(txt)>300 else ''}")
+        answer = answer_question_with_context(question, retrieved)
+        st.markdown("### Answer")
+        st.write(answer)
