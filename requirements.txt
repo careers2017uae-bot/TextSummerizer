@@ -5,6 +5,6 @@ PyPDF2
 numpy
 faiss-cpu
 groq
-python-dotenv
 sentence-transformers
 torch
+python-dotenv
