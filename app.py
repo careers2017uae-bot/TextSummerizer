@@ -1,152 +1,189 @@
-import streamlit as st
-from groq import Groq
+# app.py (Updated for GROQ API)
+
 import os
-from dotenv import load_dotenv
+import io
+import time
+from typing import List, Tuple
 
-load_dotenv()
+import streamlit as st
+import requests
+from bs4 import BeautifulSoup
+import PyPDF2
+import numpy as np
+import faiss
+from groq import Groq
 
-# Load API key
+# ---------- Configuration ----------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
 if not GROQ_API_KEY:
-    st.error("❌ GROQ_API_KEY not found! Please set it in your environment.")
+    st.error("❌ GROQ_API_KEY not found. Set it before running the app.")
     st.stop()
 
-# Initialize Groq client
 client = Groq(api_key=GROQ_API_KEY)
 
-# Streamlit UI setup
-st.set_page_config(page_title="Groq Text Summarizer", page_icon="📝", layout="centered")
+# GROQ MODELS (Updated — no decommissioned models)
+EMBED_MODEL = "nomic-embed-text"
+CHAT_MODEL = "llama-3.1-70b-versatile"
 
-st.title("📝 Groq AI — Smart Text Summarizer")
-st.write("Paste text or upload a document. Summaries are powered by **LLaMA 3.1** on Groq.")
+# Embedding dimension for nomic-embed-text
+EMBED_DIM = 768
 
-# --- INPUT TEXT AREA ---
-user_text = st.text_area(
-    "Enter text to summarize:",
-    key="user_text_input",
-    height=250
-)
+# ---------- Utilities ----------
+def extract_text_from_pdf(uploaded_file) -> str:
+    try:
+        reader = PyPDF2.PdfReader(uploaded_file)
+        return "\n".join([page.extract_text() or "" for page in reader.pages])
+    except Exception as e:
+        st.warning(f"PDF parsing failed: {e}")
+        return ""
 
-# --- SUMMARY LENGTH DROPDOWN ---
-summary_length = st.selectbox(
-    "Select summary style",
-    ["Short", "Medium", "Detailed"],
-    index=1,
-    key="summary_length_select"
-)
+def fetch_text_from_url(url: str) -> str:
+    try:
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "GroqRAG/1.0"})
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.content, "html.parser")
 
-# Summary styles
-length_map = {
-    "Short": "Summarize the text in 3–4 crisp bullet points.",
-    "Medium": "Provide a single concise paragraph summary.",
-    "Detailed": "Provide a detailed summary of 2–3 paragraphs with key details."
-}
+        for tag in soup(["script", "style", "header", "footer", "nav", "aside", "form"]):
+            tag.decompose()
 
-def summarize_text(text, style_instruction):
-    """Send summarization request to Groq."""
-    prompt = f"""
-You are an expert summarizer. {style_instruction}
+        paragraphs = [p.get_text(separator=" ", strip=True) for p in soup.find_all("p")]
+        paragraphs = [p for p in paragraphs if len(p) > 60]
 
-Summarize the following text:
-\"\"\"{text}\"\"\"
-"""
+        return "\n\n".join(paragraphs) or soup.get_text(separator=" ", strip=True)
 
-    response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=800,
-        temperature=0.3
+    except Exception as e:
+        st.warning(f"Unable to fetch URL: {e}")
+        return ""
+
+def chunk_text(text: str, chunk_size:int = 1000, overlap:int = 200) -> List[str]:
+    tokens = text.split()
+    chunks = []
+    i = 0
+    while i < len(tokens):
+        chunk_tokens = tokens[i:i+chunk_size]
+        chunks.append(" ".join(chunk_tokens))
+        i += chunk_size - overlap
+    return chunks
+
+# ---------- GROQ Embeddings + FAISS ----------
+def embed_texts(texts: List[str]) -> List[np.ndarray]:
+    vectors = []
+    batch_size = 32
+
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+
+        resp = client.embeddings.create(
+            model=EMBED_MODEL,
+            input=batch
+        )
+
+        for item in resp.data:
+            vectors.append(np.array(item.embedding, dtype=np.float32))
+
+    return vectors
+
+def build_faiss_index(vectors: List[np.ndarray]):
+    if not vectors:
+        return None
+
+    vecs = np.vstack(vectors).astype(np.float32)
+
+    # normalize for cosine similarity
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    vecs = vecs / (norms + 1e-12)
+
+    index = faiss.IndexFlatIP(vecs.shape[1])
+    index.add(vecs)
+    return index
+
+def retrieve_top_k(query, chunks, index, vectors, top_k=5):
+    q_vec = embed_texts([query])[0].astype(np.float32)
+    q_vec = q_vec / (np.linalg.norm(q_vec) + 1e-12)
+    q = q_vec.reshape(1, -1)
+
+    D, I = index.search(q, top_k)
+
+    results = [(int(idx), float(score), chunks[idx]) for score, idx in zip(D[0], I[0]) if 0 <= idx < len(chunks)]
+    return results
+
+# ---------- GROQ Chat ----------
+def chat_completion(system_prompt, user_prompt, max_tokens=500):
+    try:
+        resp = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=max_tokens,
+            temperature=0
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        return f"⚠️ Groq Error: {e}"
+
+def generate_summary_and_points(full_text: str, retriever_context=None):
+    context = "\n\n---\n\n".join(retriever_context) if retriever_context else ""
+
+    system_prompt = (
+        "You are a concise summarizer. "
+        "Return:\n1) 2–3 sentence abstract\n2) 5 bullet key points"
     )
-    return response.choices[0].message.content
 
+    user_prompt = f"{context}\n\n{full_text}"
 
-# --- SUMMARIZE BUTTON ---
-if st.button("Summarize", key="summarize_button"):
-    if not user_text.strip():
-        st.warning("⚠️ Please enter some text before summarizing.")
-        st.stop()
+    out = chat_completion(system_prompt, user_prompt)
 
-    with st.spinner("Generating summary..."):
-        try:
-            summary = summarize_text(user_text, length_map[summary_length])
-            st.subheader("📌 Summary", anchor=False)
-            st.success(summary)
-        except Exception as e:
-            st.error(f"⚠️ Groq Error: {e}")
-import streamlit as st
-from groq import Groq
-import os
-from dotenv import load_dotenv
+    if "\n1" in out:
+        abstract, points = out.split("\n1", 1)
+        return abstract.strip(), "1" + points.strip()
 
-load_dotenv()
+    return out, ""
 
-# Load API key
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# ---------- UI ----------
+st.set_page_config(page_title="Groq RAG Summarizer", page_icon="⚡", layout="wide")
 
-if not GROQ_API_KEY:
-    st.error("❌ GROQ_API_KEY not found! Please set it in your environment.")
-    st.stop()
+st.title("⚡ Groq-Powered RAG Text Summarizer")
 
-# Initialize Groq client
-client = Groq(api_key=GROQ_API_KEY)
+input_mode = st.radio("Input Type", ["Paste text", "URL", "PDF"])
 
-# Streamlit UI setup
-st.set_page_config(page_title="Groq Text Summarizer", page_icon="📝", layout="centered")
+if input_mode == "Paste text":
+    user_text = st.text_area("Paste your text", height=250, key="txt_input")
 
-st.title("📝 Groq AI — Smart Text Summarizer")
-st.write("Paste text or upload a document. Summaries are powered by **LLaMA 3.1** on Groq.")
+elif input_mode == "URL":
+    url = st.text_input("Enter URL")
+    if url:
+        fetched = fetch_text_from_url(url)
+        st.code(fetched[:4000])
+        user_text = fetched
 
-# --- INPUT TEXT AREA ---
-user_text = st.text_area(
-    "Enter text to summarize:",
-    key="user_text_input",
-    height=250
-)
+else:
+    uploaded = st.file_uploader("Upload PDF", type=["pdf"])
+    if uploaded:
+        pdf_text = extract_text_from_pdf(uploaded)
+        st.code(pdf_text[:4000])
+        user_text = pdf_text
 
-# --- SUMMARY LENGTH DROPDOWN ---
-summary_length = st.selectbox(
-    "Select summary style",
-    ["Short", "Medium", "Detailed"],
-    index=1,
-    key="summary_length_select"
-)
+chunk_size = st.slider("Chunk size (words)", 500, 3000, 1000)
+overlap = st.slider("Chunk overlap", 0, 1000, 200)
+top_k = st.slider("Top-K Retrieval", 1, 10, 4)
 
-# Summary styles
-length_map = {
-    "Short": "Summarize the text in 3–4 crisp bullet points.",
-    "Medium": "Provide a single concise paragraph summary.",
-    "Detailed": "Provide a detailed summary of 2–3 paragraphs with key details."
-}
+if st.button("Summarize"):
+    if not user_text or len(user_text.strip()) < 20:
+        st.warning("Please enter valid text.")
+    else:
+        chunks = chunk_text(user_text, chunk_size, overlap)
+        vectors = embed_texts(chunks)
+        index = build_faiss_index(vectors)
 
-def summarize_text(text, style_instruction):
-    """Send summarization request to Groq."""
-    prompt = f"""
-You are an expert summarizer. {style_instruction}
+        retrieved = retrieve_top_k("Main ideas", chunks, index, vectors, top_k)
+        retrieved_texts = [r[2] for r in retrieved]
 
-Summarize the following text:
-\"\"\"{text}\"\"\"
-"""
+        abstract, points = generate_summary_and_points(user_text, retrieved_texts)
 
-    response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=800,
-        temperature=0.3
-    )
-    return response.choices[0].message.content
+        st.subheader("📌 Abstract")
+        st.write(abstract)
 
-
-# --- SUMMARIZE BUTTON ---
-if st.button("Summarize", key="summarize_button"):
-    if not user_text.strip():
-        st.warning("⚠️ Please enter some text before summarizing.")
-        st.stop()
-
-    with st.spinner("Generating summary..."):
-        try:
-            summary = summarize_text(user_text, length_map[summary_length])
-            st.subheader("📌 Summary", anchor=False)
-            st.success(summary)
-        except Exception as e:
-            st.error(f"⚠️ Groq Error: {e}")
+        st.subheader("📌 Key Points")
+        st.write(points)
