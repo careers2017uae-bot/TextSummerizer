@@ -117,7 +117,7 @@ def answer_question_with_context(question: str, retrieved_chunks: List[Tuple[int
 
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title="Groq RAG Summarizer", page_icon="✂️", layout="wide")
-st.title("⚡ GROQ + FAISS RAG Text Summarizer")
+st.title("⚡ GROQ + FAISS RAG Text Summarizer and Q/A by Engr Bilal")
 
 input_mode = st.radio("Input Type", ["Paste text", "URL", "PDF"])
 user_text = ""
