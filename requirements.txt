@@ -2,7 +2,7 @@ streamlit
 groq
 requests
 PyPDF2
-faiss-cpu
-langchain
-langchain-community
 sentence-transformers
+faiss-cpu
+numpy
+
