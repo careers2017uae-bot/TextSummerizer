@@ -6,3 +6,5 @@ numpy
 faiss-cpu
 groq
 python-dotenv
+sentence-transformers
+torch
