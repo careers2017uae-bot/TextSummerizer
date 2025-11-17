@@ -72,18 +72,29 @@ def retrieve_context(query, index, embeddings, model, chunks, k=5):
 # Groq LLM Call
 # -------------------------------------
 def groq_chat(prompt):
-    response = client.chat.completions.create(
-        model="mixtral-8x7b-32768",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
-        max_tokens=800
-    )
-    return response.choices[0].message["content"]
+    try:
+        # Safety: truncate prompt to 120,000 chars
+        if len(prompt) > 120_000:
+            prompt = prompt[:120_000]
+
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",   # UPDATED MODEL
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=800
+        )
+        return response.choices[0].message["content"]
+
+    except Exception as e:
+        return f"⚠️ Groq Error: {str(e)}"
+
 
 # -------------------------------------
 # Streamlit UI
 # -------------------------------------
 st.set_page_config(page_title="GROQ Text Summarizer + RAG", layout="wide")
+st.write("Groq Key Loaded?", os.getenv("GROQ_API_KEY") is not None)
+
 st.title("📘 GROQ-Based Text Summarizer + RAG QA")
 st.write("Upload a document, summarize it, and ask questions using RAG.")
 
@@ -114,16 +125,22 @@ if st.button("Summarize Document"):
         st.error("Please provide content first.")
     else:
         with st.spinner("Summarizing with Groq…"):
+
+            short_doc = document_text[:40_000]  # avoid over-limit input
+
             prompt = f"""
-Summarize the following document into a clear, concise paragraph with key ideas only.
+Summarize the following document into a clear, concise paragraph 
+with the main ideas only.
 
 DOCUMENT:
-{document_text}
+{short_doc}
 """
+
             summary = groq_chat(prompt)
 
         st.subheader("📌 Summary")
         st.write(summary)
+
 
         # Build FAISS DB for RAG
         with st.spinner("Building RAG vector database…"):
