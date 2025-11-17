@@ -1,7 +1,8 @@
-streamlit>=1.22
-openai>=1.0.0
-numpy
-faiss-cpu>=1.7.3
+streamlit
+groq
 requests
-beautifulsoup4
 PyPDF2
+faiss-cpu
+langchain
+langchain-community
+sentence-transformers
