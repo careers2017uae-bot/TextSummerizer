@@ -19,7 +19,7 @@ if not GROQ_API_KEY:
     st.stop()
 
 client = Groq(api_key=GROQ_API_KEY)
-CHAT_MODEL = "llama-3.1-70b-versatile"
+CHAT_MODEL = "llama-3.3-70b-versatile"
 
 # Local embeddings model
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
